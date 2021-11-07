@@ -1,14 +1,22 @@
 use ipnetwork::Ipv4Network;
-use libc::{in_addr, sockaddr_in};
-use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+use libc::{in_addr, sockaddr_in, IFF_NO_PI, IFF_TAP, IFF_UP};
+use nix::{
+    fcntl::OFlag,
+    sys::{
+        socket::{socket, AddressFamily, SockFlag, SockType},
+        stat::Mode,
+    },
+};
 
 extern crate libc;
 
-use std::ffi::CString;
+use std::{
+    ffi::CString,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+};
 
 mod private {
-    use nix::{ioctl_readwrite_bad, ioctl_write_ptr_bad};
-
     extern crate libc;
     /// The maximum length of an interface name.
     pub const IFNAMSIZ: usize = 16;
@@ -21,6 +29,8 @@ mod private {
     pub const SIOCSIFFLAGS: u16 = 0x8914;
     pub const SIOCSIFADDR: u16 = 0x8916;
     pub const SIOCSIFNETMASK: u16 = 0x891c;
+    pub const TUNSETIFF: u8 = 202;
+    pub const TUNSETPERSIST: u8 = 203;
 
     #[repr(C)]
     #[derive(Debug)]
@@ -36,21 +46,25 @@ mod private {
         pub ifru_ivalue: libc::sockaddr_in,
     }
 
-    ioctl_write_ptr_bad!(ioctl_addbr, SIOCBRADDBR, libc::c_char);
-    ioctl_write_ptr_bad!(ioctl_delbr, SIOCBRDELBR, libc::c_char);
-    ioctl_write_ptr_bad!(ioctl_ifindex, SIOCGIFINDEX, ifreq);
-    ioctl_write_ptr_bad!(ioctl_addif, SIOCBRADDIF, ifreq);
-    ioctl_write_ptr_bad!(ioctl_delif, SIOCBRDELIF, ifreq);
-    ioctl_readwrite_bad!(ioctl_getifflags, SIOCGIFFLAGS, ifreq);
-    ioctl_write_ptr_bad!(ioctl_setifflags, SIOCSIFFLAGS, ifreq);
-    ioctl_write_ptr_bad!(ioctl_setifaddr, SIOCSIFADDR, ifreq_ipaddr);
-    ioctl_write_ptr_bad!(ioctl_setifnetmask, SIOCSIFNETMASK, ifreq_ipaddr);
+    pub mod ioctl {
+        use super::*;
+        use nix::{ioctl_readwrite_bad, ioctl_write_int, ioctl_write_ptr, ioctl_write_ptr_bad};
+
+        ioctl_write_ptr_bad!(ioctl_addbr, SIOCBRADDBR, libc::c_char);
+        ioctl_write_ptr_bad!(ioctl_delbr, SIOCBRDELBR, libc::c_char);
+        ioctl_write_ptr_bad!(ioctl_ifindex, SIOCGIFINDEX, ifreq);
+        ioctl_write_ptr_bad!(ioctl_addif, SIOCBRADDIF, ifreq);
+        ioctl_write_ptr_bad!(ioctl_delif, SIOCBRDELIF, ifreq);
+        ioctl_readwrite_bad!(ioctl_getifflags, SIOCGIFFLAGS, ifreq);
+        ioctl_write_ptr_bad!(ioctl_setifflags, SIOCSIFFLAGS, ifreq);
+        ioctl_write_ptr_bad!(ioctl_setifaddr, SIOCSIFADDR, ifreq_ipaddr);
+        ioctl_write_ptr_bad!(ioctl_setifnetmask, SIOCSIFNETMASK, ifreq_ipaddr);
+        ioctl_write_ptr!(ioctl_tunsetiff, b'T', TUNSETIFF, libc::c_int);
+        ioctl_write_int!(ioctl_tunsetpersist, b'T', TUNSETPERSIST);
+    }
 }
 pub use private::IFNAMSIZ;
-use private::{
-    ifreq, ifreq_ipaddr, ioctl_addbr, ioctl_addif, ioctl_delbr, ioctl_delif, ioctl_getifflags,
-    ioctl_ifindex, ioctl_setifaddr, ioctl_setifflags, ioctl_setifnetmask,
-};
+use private::{ifreq, ifreq_ipaddr, ioctl::*};
 
 /// Builder pattern for constructing networking bridges.
 ///
@@ -360,6 +374,77 @@ pub fn interface_set_ip(interface_name: &str, net: Ipv4Network) -> Result<(), ni
         std::ptr::copy_nonoverlapping(if_cstr.as_ptr(), ifr_mask.ifrn_name.as_mut_ptr(), length);
         ioctl_setifnetmask(sock, &mut ifr_mask as *mut ifreq_ipaddr)?;
     }
+
+    Ok(())
+}
+
+pub fn interface_is_up(interface_name: &str) -> Result<bool, nix::Error> {
+    interface_get_flags(interface_name).map(|cur_flags| cur_flags & (IFF_UP as u32) != 0)
+}
+
+pub fn interface_set_up(interface_name: &str, up: bool) -> Result<(), nix::Error> {
+    interface_set_flags(
+        interface_name,
+        if up {
+            interface_get_flags(interface_name)? | (IFF_UP as u32)
+        } else {
+            interface_get_flags(interface_name)? & !(IFF_UP as u32)
+        },
+    )
+}
+
+fn add_or_remove_tap(tap_name: &str, add: bool) -> Result<(), nix::Error> {
+    /* validate the interface name */
+    if tap_name.len() == 0 || tap_name.len() >= IFNAMSIZ {
+        return Err(nix::Error::from(nix::errno::Errno::EINVAL));
+    }
+    let tap_length = tap_name.len();
+
+    let tuntap = nix::fcntl::open("/dev/net/tun", OFlag::O_RDWR, Mode::empty())?;
+
+    let mut ifr = ifreq {
+        ifrn_name: [0; IFNAMSIZ],
+        ifru_ivalue: (IFF_TAP | IFF_NO_PI) as u32,
+    };
+
+    let tap_cstr = CString::new(tap_name).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(tap_cstr.as_ptr(), ifr.ifrn_name.as_mut_ptr(), tap_length);
+        ioctl_tunsetiff(tuntap, &ifr as *const ifreq as *const libc::c_int)?;
+
+        ioctl_tunsetpersist(tuntap, if add { 1 } else { 0 })?;
+
+        Ok(())
+    }
+}
+
+/// Create a network tap device.
+pub fn create_tap(tap_name: &str) -> Result<(), nix::Error> {
+    add_or_remove_tap(tap_name, true)
+}
+
+/// Delete a network tap device.
+pub fn delete_tap(tap_name: &str) -> Result<(), nix::Error> {
+    add_or_remove_tap(tap_name, false)
+}
+
+pub fn get_alias_from_interface(interface_name: &str) -> Result<String, std::io::Error> {
+    // looks like there is no ioctl for that operation
+    let mut file = File::open(&format!("/sys/class/net/{}/ifalias", interface_name))?;
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+
+    Ok(content)
+}
+
+pub fn set_alias_to_interface(interface_name: &str, alias: &str) -> Result<(), std::io::Error> {
+    // looks like there is no ioctl for that operation
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&format!("/sys/class/net/{}/ifalias", interface_name))?;
+
+    file.write_all(alias.as_bytes())?;
 
     Ok(())
 }
