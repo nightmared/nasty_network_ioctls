@@ -6,6 +6,7 @@ use nix::{
         socket::{socket, AddressFamily, SockFlag, SockType},
         stat::Mode,
     },
+    unistd::close,
 };
 
 extern crate libc;
@@ -31,6 +32,7 @@ mod private {
     pub const SIOCSIFNETMASK: u16 = 0x891c;
     pub const TUNSETIFF: u8 = 202;
     pub const TUNSETPERSIST: u8 = 203;
+    pub const TUNSETOWNER: u8 = 204;
 
     #[repr(C)]
     #[derive(Debug)]
@@ -60,6 +62,7 @@ mod private {
         ioctl_write_ptr_bad!(ioctl_setifaddr, SIOCSIFADDR, ifreq_ipaddr);
         ioctl_write_ptr_bad!(ioctl_setifnetmask, SIOCSIFNETMASK, ifreq_ipaddr);
         ioctl_write_ptr!(ioctl_tunsetiff, b'T', TUNSETIFF, libc::c_int);
+        ioctl_write_int!(ioctl_tunsetowner, b'T', TUNSETOWNER);
         ioctl_write_int!(ioctl_tunsetpersist, b'T', TUNSETPERSIST);
     }
 }
@@ -73,7 +76,7 @@ use private::{ifreq, ifreq_ipaddr, ioctl::*};
 /// Create a bridge named `hello_world_br` and attach two interfaces: `eth0` and `eth1`.
 ///
 /// ```rust,no_run
-///# use ::network_bridge::BridgeBuilder;
+///# use BridgeBuilder;
 ///   let result = BridgeBuilder::new("hello_world_br")
 ///                 .interface("eth0")
 ///                 .interface("eth1")
@@ -137,7 +140,7 @@ impl BridgeBuilder {
 /// Create a network bridge using the interface name supplied.
 pub fn create_bridge(name: &str) -> Result<i32, nix::Error> {
     /* Open a socket */
-    let res = socket(
+    let sock = socket(
         AddressFamily::Unix,
         SockType::Stream,
         SockFlag::empty(),
@@ -146,13 +149,17 @@ pub fn create_bridge(name: &str) -> Result<i32, nix::Error> {
 
     /* use the SIOCBRADDRBR ioctl to add the bridge */
     let cstr = CString::new(name).unwrap();
-    unsafe { ioctl_addbr(res, cstr.as_ptr()) }
+    let res = unsafe { ioctl_addbr(sock, cstr.as_ptr()) };
+
+    close(sock)?;
+
+    res
 }
 
 /// Delete an existing network bridge of the interface name supplied.
 pub fn delete_bridge(name: &str) -> Result<i32, nix::Error> {
     /* Open a socket */
-    let res = socket(
+    let sock = socket(
         AddressFamily::Unix,
         SockType::Stream,
         SockFlag::empty(),
@@ -161,7 +168,11 @@ pub fn delete_bridge(name: &str) -> Result<i32, nix::Error> {
 
     /* use the SIOCBRDELBR ioctl to delete the bridge */
     let cstr = CString::new(name).unwrap();
-    unsafe { ioctl_delbr(res, cstr.as_ptr()) }
+    let res = unsafe { ioctl_delbr(sock, cstr.as_ptr()) };
+
+    close(sock)?;
+
+    res
 }
 
 /// Converts an interface name into the identifier used by the kernel.
@@ -208,6 +219,8 @@ pub fn interface_id(interface: &str) -> Result<i32, nix::Error> {
         ioctl_ifindex(sock, &ifr)
     };
 
+    close(sock)?;
+
     result.map(|_| ifr.ifru_ivalue as i32)
 }
 
@@ -233,7 +246,7 @@ fn bridge_del_add_if(interface_id: i32, bridge: &str, add: bool) -> Result<i32, 
 
     let br_cstr = CString::new(bridge).unwrap();
 
-    unsafe {
+    let res = unsafe {
         /* copy the bridge name to the ifreq */
         std::ptr::copy_nonoverlapping(br_cstr.as_ptr(), ifr.ifrn_name.as_mut_ptr(), length);
 
@@ -242,7 +255,11 @@ fn bridge_del_add_if(interface_id: i32, bridge: &str, add: bool) -> Result<i32, 
         } else {
             ioctl_delif(sock, &ifr)
         }
-    }
+    };
+
+    close(sock)?;
+
+    res
 }
 
 /// Attach an interface to a bridge.
@@ -281,13 +298,16 @@ pub fn interface_get_flags(interface_name: &str) -> Result<u32, nix::Error> {
 
     let if_cstr = CString::new(interface_name).unwrap();
 
-    unsafe {
+    let res = unsafe {
         /* copy the bridge name to the ifreq */
         std::ptr::copy_nonoverlapping(if_cstr.as_ptr(), ifr.ifrn_name.as_mut_ptr(), length);
 
-        ioctl_getifflags(sock, &mut ifr as *mut ifreq)?;
-        Ok(ifr.ifru_ivalue)
-    }
+        ioctl_getifflags(sock, &mut ifr as *mut ifreq)
+    };
+
+    close(sock)?;
+
+    res.map(|_| ifr.ifru_ivalue)
 }
 
 pub fn interface_set_flags(interface_name: &str, flags: u32) -> Result<(), nix::Error> {
@@ -312,14 +332,16 @@ pub fn interface_set_flags(interface_name: &str, flags: u32) -> Result<(), nix::
 
     let if_cstr = CString::new(interface_name).unwrap();
 
-    unsafe {
+    let res = unsafe {
         /* copy the bridge name to the ifreq */
         std::ptr::copy_nonoverlapping(if_cstr.as_ptr(), ifr.ifrn_name.as_mut_ptr(), length);
 
-        ioctl_setifflags(sock, &mut ifr as *mut ifreq)?;
-    }
+        ioctl_setifflags(sock, &mut ifr as *mut ifreq)
+    };
 
-    Ok(())
+    close(sock)?;
+
+    res.map(|_| ())
 }
 
 pub fn interface_set_ip(interface_name: &str, net: Ipv4Network) -> Result<(), nix::Error> {
@@ -367,15 +389,17 @@ pub fn interface_set_ip(interface_name: &str, net: Ipv4Network) -> Result<(), ni
         ifru_ivalue: mask,
     };
 
-    unsafe {
+    let res = unsafe {
         std::ptr::copy_nonoverlapping(if_cstr.as_ptr(), ifr_ip.ifrn_name.as_mut_ptr(), length);
-        ioctl_setifaddr(sock, &mut ifr_ip as *mut ifreq_ipaddr)?;
+        let res = ioctl_setifaddr(sock, &mut ifr_ip as *mut ifreq_ipaddr);
 
         std::ptr::copy_nonoverlapping(if_cstr.as_ptr(), ifr_mask.ifrn_name.as_mut_ptr(), length);
-        ioctl_setifnetmask(sock, &mut ifr_mask as *mut ifreq_ipaddr)?;
-    }
+        res.and_then(|_| ioctl_setifnetmask(sock, &mut ifr_mask as *mut ifreq_ipaddr))
+    };
 
-    Ok(())
+    close(sock)?;
+
+    res.map(|_| ())
 }
 
 pub fn interface_is_up(interface_name: &str) -> Result<bool, nix::Error> {
@@ -393,7 +417,11 @@ pub fn interface_set_up(interface_name: &str, up: bool) -> Result<(), nix::Error
     )
 }
 
-fn add_or_remove_tap(tap_name: &str, add: bool) -> Result<(), nix::Error> {
+fn add_or_remove_tap(
+    tap_name: &str,
+    add: bool,
+    owner_uid: impl Into<Option<u32>>,
+) -> Result<(), nix::Error> {
     /* validate the interface name */
     if tap_name.len() == 0 || tap_name.len() >= IFNAMSIZ {
         return Err(nix::Error::from(nix::errno::Errno::EINVAL));
@@ -408,24 +436,32 @@ fn add_or_remove_tap(tap_name: &str, add: bool) -> Result<(), nix::Error> {
     };
 
     let tap_cstr = CString::new(tap_name).unwrap();
-    unsafe {
+    let res = unsafe {
         std::ptr::copy_nonoverlapping(tap_cstr.as_ptr(), ifr.ifrn_name.as_mut_ptr(), tap_length);
-        ioctl_tunsetiff(tuntap, &ifr as *const ifreq as *const libc::c_int)?;
+        let mut res = ioctl_tunsetiff(tuntap, &ifr as *const ifreq as *const libc::c_int);
 
-        ioctl_tunsetpersist(tuntap, if add { 1 } else { 0 })?;
+        res = res.and_then(|_| ioctl_tunsetpersist(tuntap, if add { 1 } else { 0 }));
 
-        Ok(())
-    }
+        if let Some(uid) = owner_uid.into() {
+            res = res.and_then(|_| ioctl_tunsetowner(tuntap, uid as u64));
+        }
+
+        res
+    };
+
+    close(tuntap)?;
+
+    res.map(|_| ())
 }
 
 /// Create a network tap device.
-pub fn create_tap(tap_name: &str) -> Result<(), nix::Error> {
-    add_or_remove_tap(tap_name, true)
+pub fn create_tap(tap_name: &str, owner_uid: impl Into<Option<u32>>) -> Result<(), nix::Error> {
+    add_or_remove_tap(tap_name, true, owner_uid)
 }
 
 /// Delete a network tap device.
 pub fn delete_tap(tap_name: &str) -> Result<(), nix::Error> {
-    add_or_remove_tap(tap_name, false)
+    add_or_remove_tap(tap_name, false, None)
 }
 
 pub fn get_alias_from_interface(interface_name: &str) -> Result<String, std::io::Error> {
