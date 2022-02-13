@@ -15,6 +15,7 @@ use std::{
     ffi::CString,
     fs::{File, OpenOptions},
     io::{Read, Write},
+    net::Ipv4Addr,
 };
 
 mod private {
@@ -30,6 +31,7 @@ mod private {
     pub const SIOCSIFFLAGS: u16 = 0x8914;
     pub const SIOCSIFADDR: u16 = 0x8916;
     pub const SIOCSIFNETMASK: u16 = 0x891c;
+    pub const SIOCADDRT: u16 = 0x890b;
     pub const TUNSETIFF: u8 = 202;
     pub const TUNSETPERSIST: u8 = 203;
     pub const TUNSETOWNER: u8 = 204;
@@ -61,6 +63,7 @@ mod private {
         ioctl_write_ptr_bad!(ioctl_setifflags, SIOCSIFFLAGS, ifreq);
         ioctl_write_ptr_bad!(ioctl_setifaddr, SIOCSIFADDR, ifreq_ipaddr);
         ioctl_write_ptr_bad!(ioctl_setifnetmask, SIOCSIFNETMASK, ifreq_ipaddr);
+        ioctl_write_ptr_bad!(ioctl_addrt, SIOCADDRT, libc::rtentry);
         ioctl_write_ptr!(ioctl_tunsetiff, b'T', TUNSETIFF, libc::c_int);
         ioctl_write_int!(ioctl_tunsetowner, b'T', TUNSETOWNER);
         ioctl_write_int!(ioctl_tunsetpersist, b'T', TUNSETPERSIST);
@@ -481,6 +484,39 @@ pub fn set_alias_to_interface(interface_name: &str, alias: &str) -> Result<(), s
         .open(&format!("/sys/class/net/{}/ifalias", interface_name))?;
 
     file.write_all(alias.as_bytes())?;
+
+    Ok(())
+}
+
+pub fn set_default_route(gateway: Ipv4Addr) -> Result<(), nix::Error> {
+    /* Open a socket */
+    let sock = socket(
+        AddressFamily::Inet,
+        SockType::Datagram,
+        SockFlag::empty(),
+        None,
+    )?;
+    unsafe {
+        let mut rtentry = std::mem::MaybeUninit::<libc::rtentry>::zeroed().assume_init();
+        rtentry.rt_genmask = std::mem::transmute(sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 0,
+            sin_addr: nix::sys::socket::Ipv4Addr::new(0, 0, 0, 0).0,
+            sin_zero: [0; 8],
+        });
+        rtentry.rt_dst = rtentry.rt_genmask;
+        rtentry.rt_gateway = std::mem::transmute(sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 0,
+            sin_addr: nix::sys::socket::Ipv4Addr::from_std(&gateway).0,
+            sin_zero: [0; 8],
+        });
+        rtentry.rt_flags = libc::RTF_GATEWAY | libc::RTF_DEFAULT as u16;
+
+        ioctl_addrt(sock, &rtentry as *const _)?;
+    }
+
+    close(sock)?;
 
     Ok(())
 }
