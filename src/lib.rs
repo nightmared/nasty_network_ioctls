@@ -32,6 +32,7 @@ mod private {
     pub const SIOCSIFADDR: u16 = 0x8916;
     pub const SIOCSIFNETMASK: u16 = 0x891c;
     pub const SIOCADDRT: u16 = 0x890b;
+    pub const SIOCDELRT: u16 = 0x890c;
     pub const TUNSETIFF: u8 = 202;
     pub const TUNSETPERSIST: u8 = 203;
     pub const TUNSETOWNER: u8 = 204;
@@ -64,6 +65,7 @@ mod private {
         ioctl_write_ptr_bad!(ioctl_setifaddr, SIOCSIFADDR, ifreq_ipaddr);
         ioctl_write_ptr_bad!(ioctl_setifnetmask, SIOCSIFNETMASK, ifreq_ipaddr);
         ioctl_write_ptr_bad!(ioctl_addrt, SIOCADDRT, libc::rtentry);
+        ioctl_write_ptr_bad!(ioctl_delrt, SIOCDELRT, libc::rtentry);
         ioctl_write_ptr!(ioctl_tunsetiff, b'T', TUNSETIFF, libc::c_int);
         ioctl_write_int!(ioctl_tunsetowner, b'T', TUNSETOWNER);
         ioctl_write_int!(ioctl_tunsetpersist, b'T', TUNSETPERSIST);
@@ -441,15 +443,17 @@ fn add_or_remove_tap(
     let tap_cstr = CString::new(tap_name).unwrap();
     let res = unsafe {
         std::ptr::copy_nonoverlapping(tap_cstr.as_ptr(), ifr.ifrn_name.as_mut_ptr(), tap_length);
-        let mut res = ioctl_tunsetiff(tuntap, &ifr as *const ifreq as *const libc::c_int);
+        if add {
+            let mut res = ioctl_tunsetiff(tuntap, &ifr as *const ifreq as *const libc::c_int)
+                .and_then(|_| ioctl_tunsetpersist(tuntap, 1));
 
-        res = res.and_then(|_| ioctl_tunsetpersist(tuntap, if add { 1 } else { 0 }));
-
-        if let Some(uid) = owner_uid.into() {
-            res = res.and_then(|_| ioctl_tunsetowner(tuntap, uid as u64));
+            if let Some(uid) = owner_uid.into() {
+                res = res.and_then(|_| ioctl_tunsetowner(tuntap, uid as u64));
+            }
+            res
+        } else {
+            ioctl_tunsetpersist(tuntap, 0)
         }
-
-        res
     };
 
     close(tuntap)?;
@@ -514,6 +518,57 @@ pub fn set_default_route(gateway: Ipv4Addr) -> Result<(), nix::Error> {
         rtentry.rt_flags = libc::RTF_GATEWAY | libc::RTF_DEFAULT as u16;
 
         ioctl_addrt(sock, &rtentry as *const _)?;
+    }
+
+    close(sock)?;
+
+    Ok(())
+}
+
+pub fn add_or_delete_route(
+    interface_name: Option<&str>,
+    dest: Ipv4Addr,
+    prefix: u8,
+    add: bool,
+) -> Result<(), nix::Error> {
+    let network = Ipv4Network::new(dest, prefix).map_err(|_| nix::Error::EINVAL)?;
+    /* Open a socket */
+    let sock = socket(
+        AddressFamily::Inet,
+        SockType::Datagram,
+        SockFlag::empty(),
+        None,
+    )?;
+    unsafe {
+        let mut rtentry = std::mem::MaybeUninit::<libc::rtentry>::zeroed().assume_init();
+        let mut dev = None;
+        if let Some(interface_name) = interface_name {
+            let dev_name = CString::new(interface_name).map_err(|_| nix::Error::EINVAL)?;
+            rtentry.rt_dev = dev_name.as_c_str().as_ptr() as *mut i8;
+            dev = Some(dev_name);
+        }
+        rtentry.rt_genmask = std::mem::transmute(sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 0,
+            sin_addr: nix::sys::socket::Ipv4Addr::from_std(&network.mask()).0,
+            sin_zero: [0; 8],
+        });
+        rtentry.rt_dst = std::mem::transmute(sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 0,
+            sin_addr: nix::sys::socket::Ipv4Addr::from_std(&dest).0,
+            sin_zero: [0; 8],
+        });
+        rtentry.rt_flags = if add { libc::RTF_UP as u16 } else { 0 };
+
+        if add {
+            ioctl_addrt(sock, &rtentry as *const _)?;
+        } else {
+            ioctl_delrt(sock, &rtentry as *const _)?;
+        }
+
+        // the device pointer must live till now
+        drop(dev);
     }
 
     close(sock)?;
